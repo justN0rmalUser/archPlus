@@ -1,6 +1,3 @@
-# Вход в систему
-arch-chroot /mnt
-
 # Для шифрования используем encrypt и lvm2 hooks
 MKINITCPIO_HOOKS="base udev autodetect microcode modconf kms keyboard keymap consolefont block encrypt lvm2 filesystems fsck"
 CRYPT_UUID=$(blkid -s UUID -o value /dev/sda2)
