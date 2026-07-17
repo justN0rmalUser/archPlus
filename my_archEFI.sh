@@ -151,7 +151,7 @@ pacstrap -K /mnt \
     networkmanager iwd \
     intel-ucode sudo pipewire pipewire-pulse pipewire-alsa pavucontrol wireplumber \
     nvidia-open nvidia-utils nvidia-settings \
-    nano --noconfirm
+    nano wget --noconfirm
 
 LOG_info "✅ Базовая система установлена"
 
