@@ -52,6 +52,8 @@ loadkeys ru && setfont cyr-sun16
 echo "⏰ Синхронизация системных часов..."
 timedatectl set-ntp true && hwclock --systohc
 
+pacman -S sgdisk
+
 ## ╔═══════════════════════════╗
 ## ║ Часть 02 - разметка диска ║
 ## ╚═══════════════════════════╝
