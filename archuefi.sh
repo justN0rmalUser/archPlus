@@ -17,25 +17,25 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-log_info() {
+LOG_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
 }
 
-log_success() {
+LOG_success() {
     echo -e "${GREEN}[OK]${NC} $1"
 }
 
-log_warn() {
+LOG_warn() {
     echo -e "${YELLOW}[WARN]${NC} $1"
 }
 
-log_error() {
+LOG_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
 echo "╔════════════════════════════════════════════════════════════════════╗"
 echo "║     Arch Linux Fast Install v3.2.0 (UEFI) - 2025-2026              ║"
-echo "║     Базовая установка системы с опциональным LUKS шифрованием     ║"
+echo "║     Базовая установка системы с опциональным LUKS шифрованием      ║"
 echo "╚════════════════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -43,20 +43,9 @@ echo ""
 # 0. ВЫБОР РЕЖИМА ШИФРОВАНИЯ
 # =============================================================================
 
-echo "🔐 Выберите режим установки:"
-echo "  1) Обычная установка (без шифрования) - быстрее, проще"
-echo "  2) Установка с LUKS шифрованием (LVM on LUKS) - безопаснее"
-echo ""
-read -p "Ваш выбор (1/2): " install_mode
-
-if [[ $install_mode == "2" ]]; then
-    USE_ENCRYPTION=true
-    log_warn "Выбрано шифрование LUKS. Потребуется ввод пароля при каждой загрузке."
-else
-    USE_ENCRYPTION=false
-    log_info "Выбрана обычная установка без шифрования."
-fi
-
+echo "Режим установки: с LUKS шифрованием (LVM on LUKS)"
+USE_ENCRYPTION=true
+LOG_warn "Выбрано шифрование LUKS. Потребуется ввод пароля при каждой загрузке."
 echo ""
 
 # =============================================================================
@@ -87,86 +76,10 @@ fi
 # 2. РАЗМЕТКА ДИСКА (GPT/UEFI)
 # =============================================================================
 
-if $USE_ENCRYPTION; then
-    # РАЗМЕТКА С ШИФРОВАНИЕМ (LVM on LUKS)
-    echo "💾 Создание разделов для шифрования..."
-    echo "  Разметка: EFI (512M) | LUKS+LVM (всё остальное)"
-    echo "  LVM volumes: swap (4G) | root (30G) | home (остальное)"
-    (
-        echo g;      # Создать GPT таблицу
-
-        echo n;      # Раздел 1: EFI
-        echo;
-        echo;
-        echo +512M;
-        echo t;
-        echo 1;      # Тип: EFI System
-
-        echo n;      # Раздел 2: LUKS контейнер (всё остальное)
-        echo;
-        echo;
-        echo;
-        echo t;
-        echo 2;
-        echo 30;     # Тип: Linux LVM (или 8309 для LUKS)
-
-        echo w;      # Записать изменения
-    ) | fdisk /dev/sda
-
-    echo "📋 Ваша разметка диска:"
-    fdisk -l /dev/sda
-    echo ""
-
-    # =============================================================================
-    # 3. НАСТРОЙКА LUKS И LVM
-    # =============================================================================
-
-    echo "🔐 Настройка LUKS шифрования..."
-    log_warn "Введите пароль для шифрования диска (минимум 8 символов):"
-    
-    # Создаём LUKS контейнер с pbkdf2 для совместимости с GRUB
-    # Используем LUKS2 с pbkdf2 (GRUB поддерживает)
-    cryptsetup luksFormat --type luks2 --pbkdf pbkdf2 --cipher aes-xts-plain64 --key-size 512 --hash sha512 /dev/sda2
-    
-    log_success "LUKS контейнер создан."
-    
-    # Открываем контейнер
-    echo "🔓 Открытие LUKS контейнера..."
-    cryptsetup open /dev/sda2 cryptlvm
-    log_success "Контейнер открыт как /dev/mapper/cryptlvm"
-
-    # Создаём LVM
-    echo "💾 Создание LVM структуры..."
-    pvcreate /dev/mapper/cryptlvm
-    vgcreate vg0 /dev/mapper/cryptlvm
-    
-    # Создаём logical volumes
-    lvcreate -L 4G vg0 -n swap
-    lvcreate -L 30G vg0 -n root
-    lvcreate -l 100%FREE vg0 -n home
-    
-    log_success "LVM создан: swap (4G), root (30G), home (остальное)"
-
-    # Форматирование
-    echo "🗂️  Форматирование разделов..."
-    mkfs.fat -F32 /dev/sda1
-    mkswap /dev/vg0/swap -L swap
-    mkfs.ext4 /dev/vg0/root -L root
-    mkfs.ext4 /dev/vg0/home -L home
-    
-    log_success "Разделы отформатированы."
-
-    # Монтирование
-    echo "📂 Монтирование разделов..."
-    mount /dev/vg0/root /mnt
-    mkdir -p /mnt/boot/efi /mnt/home
-    mount /dev/sda1 /mnt/boot/efi
-    mount /dev/vg0/home /mnt/home
-    swapon /dev/vg0/swap
-
-else
-    # ОБЫЧНАЯ РАЗМЕТКА (без шифрования)
-    echo "💾 Создание разделов..."
+# РАЗМЕТКА С ШИФРОВАНИЕМ (LVM on LUKS)
+echo "💾 Создание разделов для шифрования..."
+echo "   Разметка: EFI (512M) | LUKS+LVM (всё остальное)"
+echo "   LVM volumes: swap (4G) | root (30G) | home (остальное)"
 (
     echo g;      # Создать GPT таблицу
 
@@ -177,26 +90,67 @@ else
     echo t;
     echo 1;      # Тип: EFI System
 
-    echo n;      # Раздел 2: root
+    echo n;      # Раздел 2: LUKS контейнер (всё остальное)
     echo;
     echo;
-    echo +30G;
-
-    echo n;      # Раздел 3: swap
     echo;
-    echo;
-    echo +4G;
     echo t;
-    echo 3;
-    echo 19;     # Тип: Linux swap
-
-    echo n;      # Раздел 4: home
-    echo;
-    echo;
-    echo;
+    echo 2;
+    echo 30;     # Тип: Linux LVM (или 8309 для LUKS)
 
     echo w;      # Записать изменения
 ) | fdisk /dev/sda
+
+echo "📋 Ваша разметка диска:"
+fdisk -l /dev/sda
+echo ""
+
+# =============================================================================
+# 3. НАСТРОЙКА LUKS И LVM
+# =============================================================================
+
+echo "🔐 Настройка LUKS шифрования..."
+LOG_warn "Введите пароль для шифрования диска (минимум 8 символов):"
+
+# Создаём LUKS контейнер с pbkdf2 для совместимости с GRUB
+# Используем LUKS2 с pbkdf2 (GRUB поддерживает)
+cryptsetup luksFormat --type luks2 --pbkdf pbkdf2 --cipher aes-xts-plain64 --key-size 512 --hash sha512 /dev/sda2
+
+LOG_success "LUKS контейнер создан."
+
+# Открываем контейнер
+echo "🔓 Открытие LUKS контейнера..."
+cryptsetup open /dev/sda2 cryptlvm
+LOG_success "Контейнер открыт как /dev/mapper/cryptlvm"
+
+# Создаём LVM
+echo "💾 Создание LVM структуры..."
+pvcreate /dev/mapper/cryptlvm
+vgcreate vg0 /dev/mapper/cryptlvm
+
+# Создаём logical volumes
+lvcreate -L 4G vg0 -n swap
+lvcreate -L 30G vg0 -n root
+lvcreate -l 100%FREE vg0 -n home
+
+LOG_success "LVM создан: swap (4G), root (30G), home (остальное)"
+
+# Форматирование
+echo "🗂️  Форматирование разделов..."
+mkfs.fat -F32 /dev/sda1
+mkswap /dev/vg0/swap -L swap
+mkfs.ext4 /dev/vg0/root -L root
+mkfs.ext4 /dev/vg0/home -L home
+
+LOG_success "Разделы отформатированы."
+
+# Монтирование
+echo "📂 Монтирование разделов..."
+mount /dev/vg0/root /mnt
+mkdir -p /mnt/boot/efi /mnt/home
+mount /dev/sda1 /mnt/boot/efi
+mount /dev/vg0/home /mnt/home
+swapon /dev/vg0/swap
 
 echo "📋 Ваша разметка диска:"
 fdisk -l /dev/sda
@@ -282,7 +236,7 @@ if $USE_ENCRYPTION; then
     # Получаем UUID зашифрованного раздела
     CRYPT_UUID=$(blkid -s UUID -o value /dev/sda2)
     echo "cryptlvm UUID=$CRYPT_UUID none luks" >> /mnt/etc/crypttab
-    log_success "crypttab настроен"
+    LOG_success "crypttab настроен"
 fi
 
 # Проверяем fstab
@@ -457,7 +411,7 @@ systemctl --global enable pipewire pipewire-pulse
 # --- Завершение ---
 echo ""
 echo "╔════════════════════════════════════════════════════════════════════╗"
-echo "║     ✅ Базовая установка завершена!                               ║"
+echo "║     ✅ Базовая установка завершена!                                ║"
 echo "╚════════════════════════════════════════════════════════════════════╝"
 echo ""
 
