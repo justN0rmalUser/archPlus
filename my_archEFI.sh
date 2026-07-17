@@ -52,8 +52,6 @@ loadkeys ru && setfont cyr-sun16
 echo "⏰ Синхронизация системных часов..."
 timedatectl set-ntp true && hwclock --systohc
 
-pacman -S sgdisk
-
 ## ╔═══════════════════════════╗
 ## ║ Часть 02 - разметка диска ║
 ## ╚═══════════════════════════╝
@@ -90,7 +88,7 @@ sgdisk  -n3:0:0 \
         $DISK
 
 # установка файловых систем
-mkfs.fat -F32 -L ESP ${DISK}1
+mkfs.fat -F32 ${DISK}1
 
 mkswap ${DISK}2 && swapon ${DISK}2
 
@@ -107,7 +105,7 @@ cryptsetup luksFormat \
 cryptsetup open "${DISK}3" cryptroot
 
 # Форматирование Btrfs
-mkfs.btrfs -L ROOT /dev/mapper/cryptroot
+mkfs.btrfs /dev/mapper/cryptroot
 
 # Создание подтомов
 mount /dev/mapper/cryptroot /mnt
