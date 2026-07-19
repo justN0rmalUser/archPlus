@@ -1,169 +1,292 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# =============================================================================
-# Arch Linux Fast Install
-# Быстрая установка Arch Linux + LUKS шифрование
-# =============================================================================
+set -Eeuo pipefail
 
-## ╔═════════════════════════════════════════════════════════════════════════════╗
-## ║ Часть 01 - установка ф-ий логгирования; корректное время и настройка локали ║
-## ╚═════════════════════════════════════════════════════════════════════════════╝
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=config.sh
+source "${SCRIPT_DIR}/config.sh"
+# shellcheck source=lib/common.sh
+source "${SCRIPT_DIR}/lib/common.sh"
 
-set -e  # Прервать выполнение при ошибке
+DRY_RUN=false
+ROOT_OPENED=false
+SWAP_OWNED=false
+TARGET_MOUNTED=false
+INSTALL_FINISHED=false
+LOG_FILE="/tmp/archplus-install-$(date +%Y%m%d-%H%M%S).log"
 
-# Некоторые глобальные переменные
-DISK=/dev/sda
-SWAP_SPACE=17
+usage() {
+    cat <<USAGE
+Использование: sudo bash my_archEFI.sh [--dry-run] [--help]
 
-# Цвета для вывода
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+Автоматически устанавливает Arch Linux на ${INSTALL_DISK}.
 
-LOG_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+  --dry-run  показать итоговую схему и команды без проверки/изменения системы
+  --help     показать эту справку
+
+Обычный запуск БЕЗВОЗВРАТНО удаляет все данные с ${INSTALL_DISK}.
+USAGE
 }
 
-LOG_success() {
-    echo -e "${GREEN}[OK]${NC} $1"
+parse_arguments() {
+    while (($#)); do
+        case "$1" in
+            --dry-run)
+                DRY_RUN=true
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                usage >&2
+                die "Неизвестный аргумент: $1"
+                ;;
+        esac
+        shift
+    done
 }
 
-LOG_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+print_dry_run() {
+    cat <<PLAN
+DRY RUN: никакие системные команды не выполняются.
+
+Целевой диск: ${INSTALL_DISK}
+  ${EFI_PART}   EFI System Partition, ${EFI_SIZE_GIB} GiB, FAT32, /efi
+  ${SWAP_PART}  LUKS2 swap, ${SWAP_SIZE_GIB} GiB, без гибернации
+  ${ROOT_PART}  LUKS2 (PBKDF2) + Btrfs, оставшееся пространство
+
+Btrfs:
+  @            /
+  @snapshots   /.snapshots
+  options      ${BTRFS_MOUNT_OPTIONS}
+
+Система: linux-zen, NVIDIA open DKMS, GRUB, Snapper/grub-btrfs, niri
+Пользователь: ${USERNAME}; hostname: ${HOSTNAME}; timezone: ${TIMEZONE}
+
+Разрушающие команды, которые были бы выполнены только после подтверждения:
+PLAN
+    quote_command wipefs --all --force "${INSTALL_DISK}"
+    quote_command sgdisk --zap-all "${INSTALL_DISK}"
+    quote_command cryptsetup luksFormat "${ROOT_PART}"
+    quote_command mkfs.btrfs "${ROOT_MAPPER}"
+    quote_command pacstrap -K "${TARGET_MOUNT}" "${BASE_PACKAGES[@]}"
 }
 
-LOG_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+cleanup() {
+    local exit_code=$?
+    local cleanup_failed=false
+    set +e
+
+    if [[ "${TARGET_MOUNTED}" == true ]] && mountpoint -q "${TARGET_MOUNT}"; then
+        log_info "Размонтирование ${TARGET_MOUNT}..."
+        umount -R "${TARGET_MOUNT}" || cleanup_failed=true
+    fi
+    if [[ "${SWAP_OWNED}" == true ]] && cryptsetup status "${SWAP_MAPPER_NAME}" >/dev/null 2>&1; then
+        cryptsetup close "${SWAP_MAPPER_NAME}" || cleanup_failed=true
+    fi
+    if [[ "${ROOT_OPENED}" == true ]] && cryptsetup status "${ROOT_MAPPER_NAME}" >/dev/null 2>&1; then
+        cryptsetup close "${ROOT_MAPPER_NAME}" || cleanup_failed=true
+    fi
+
+    if [[ "${cleanup_failed}" == true ]]; then
+        log_error "Не удалось полностью отключить mount/mapper-устройства; проверьте их вручную."
+        if ((exit_code == 0)); then
+            trap - EXIT
+            exit 1
+        fi
+    elif ((exit_code != 0)); then
+        log_error "Установка прервана (код ${exit_code}). Журнал: ${LOG_FILE}"
+    elif [[ "${INSTALL_FINISHED}" == true ]]; then
+        log_success "Установка завершена; файловые системы безопасно отключены."
+    fi
 }
 
-# приветствие
-echo "╔════════════════════════════════════════════════════════════════════╗"
-echo "║     Arch Linux Fast Install v3.2.0 (UEFI) - 2025-2026              ║"
-echo "║     Базовая установка системы с опциональным LUKS шифрованием      ║"
-echo "╚════════════════════════════════════════════════════════════════════╝"
-echo ""
+preflight() {
+    require_root
+    require_commands \
+        arch-chroot blkid blockdev btrfs cryptsetup curl findmnt genfstab \
+        dd install loadkeys lsblk mkfs.btrfs mkfs.fat mkswap mount mountpoint \
+        pacstrap sgdisk setfont timedatectl udevadm umount wipefs
 
-# время и клава
-echo "📋 Настройка клавиатуры и шрифта..."
-loadkeys ru && setfont cyr-sun16
+    local required_file
+    for required_file in \
+        "${SCRIPT_DIR}/chroot.sh" \
+        "${SCRIPT_DIR}/niri.sh" \
+        "${SCRIPT_DIR}/config.sh" \
+        "${SCRIPT_DIR}/lib/common.sh" \
+        "${SCRIPT_DIR}/attach/bg.jpg"; do
+        [[ -r "${required_file}" ]] || die "Не найден обязательный файл: ${required_file}"
+    done
 
-echo "⏰ Синхронизация системных часов..."
-timedatectl set-ntp true && hwclock --systohc
+    [[ -d /sys/firmware/efi/efivars ]] || die "Live ISO загружен не в UEFI-режиме."
+    [[ -b "${INSTALL_DISK}" ]] || die "Диск ${INSTALL_DISK} не найден."
+    [[ "$(lsblk -dn -o RO "${INSTALL_DISK}" | tr -d ' ')" == "0" ]] || die "Диск доступен только для чтения."
+    [[ ! -e "${ROOT_MAPPER}" ]] || die "Mapper ${ROOT_MAPPER} уже существует."
+    [[ ! -e "${SWAP_MAPPER}" ]] || die "Mapper ${SWAP_MAPPER} уже существует."
+    mountpoint -q "${TARGET_MOUNT}" && die "${TARGET_MOUNT} уже является точкой монтирования."
 
-## ╔═══════════════════════════╗
-## ║ Часть 02 - разметка диска ║
-## ╚═══════════════════════════╝
+    if lsblk -nrpo MOUNTPOINT "${INSTALL_DISK}" | grep -q '[^[:space:]]'; then
+        die "Один из разделов ${INSTALL_DISK} смонтирован. Сначала размонтируйте его."
+    fi
 
-# предупреждалка
-echo ""
-echo "╔═════════════════════════════════════════════╗"
-echo "║ ⚠️ ВНИМАНИЕ! СКРИПТ ЗАТРЕТ ДИСК /dev/sda    ║"
-echo "║    Если у вас ценные данные - СОХРАНИТЕ ИХ! ║"
-echo "╚═════════════════════════════════════════════╝"
-echo ""
-read -p "Продолжить установку? (yes/no): " confirm
-if [[ $confirm != "yes" ]]; then
-    LOG_warn "Установка отменена."
-    exit 1
-fi
+    local disk_bytes min_bytes
+    disk_bytes="$(blockdev --getsize64 "${INSTALL_DISK}")"
+    min_bytes=$((MIN_DISK_SIZE_GIB * 1024 * 1024 * 1024))
+    ((disk_bytes >= min_bytes)) || die "Диск должен быть не меньше ${MIN_DISK_SIZE_GIB} GiB."
 
-# разметка и затирка
-sgdisk --zap-all $DISK
+    curl -fsSI --connect-timeout 10 https://archlinux.org/ >/dev/null \
+        || die "Нет доступа к archlinux.org; проверьте сеть и DNS."
+}
 
-# efi
-sgdisk  -n1:0:+1G \
-        -t1:ef00 \
-        $DISK
+confirm_disk_erasure() {
+    printf '\nЦелевой диск:\n'
+    lsblk -d -o NAME,PATH,SIZE,MODEL,TRAN,RO "${INSTALL_DISK}"
+    printf '\nТекущая разметка:\n'
+    lsblk -o NAME,PATH,SIZE,FSTYPE,MOUNTPOINTS "${INSTALL_DISK}"
+    printf '\nВНИМАНИЕ: все данные на %s будут уничтожены.\n' "${INSTALL_DISK}"
+    printf 'Для продолжения введите точно: ERASE %s\n> ' "${INSTALL_DISK}"
 
-# swap раздел
-sgdisk  -n2:0:+${SWAP_SPACE}G \
-        -t2:8200 \
-        $DISK
+    local confirmation
+    IFS= read -r confirmation
+    [[ "${confirmation}" == "ERASE ${INSTALL_DISK}" ]] || die "Подтверждение не совпало; установка отменена."
+}
 
-# основное дисковое пространство
-sgdisk  -n3:0:0 \
-        -t3:8300 \
-        $DISK
+prepare_live_environment() {
+    # GRUB reads the LUKS passphrase with a US keymap. Creating it with the
+    # same layout prevents an unbootable passphrase/key-position mismatch.
+    loadkeys us
+    setfont "${CONSOLE_FONT}"
+    timedatectl set-ntp true
+}
 
-# установка файловых систем
-mkfs.fat -F32 ${DISK}1
+partition_disk() {
+    log_info "Очистка сигнатур и создание GPT..."
+    wipefs --all --force "${INSTALL_DISK}"
+    sgdisk --zap-all "${INSTALL_DISK}"
+    sgdisk \
+        --new=1:0:+${EFI_SIZE_GIB}G --typecode=1:ef00 --change-name=1:EFI \
+        --new=2:0:+${SWAP_SIZE_GIB}G --typecode=2:8309 --change-name=2:cryptswap \
+        --new=3:0:0 --typecode=3:8309 --change-name=3:cryptroot \
+        "${INSTALL_DISK}"
+    blockdev --rereadpt "${INSTALL_DISK}"
+    udevadm settle
+    [[ -b "${EFI_PART}" && -b "${SWAP_PART}" && -b "${ROOT_PART}" ]] \
+        || die "Ядро не обнаружило созданные разделы."
+}
 
-mkswap ${DISK}2 && swapon ${DISK}2
+prepare_encrypted_root() {
+    log_info "Форматирование EFI и создание LUKS2 root..."
+    mkfs.fat -F 32 -n EFI "${EFI_PART}"
+    log_warn "Введите и подтвердите ASCII-пароль LUKS (раскладка US, как в GRUB)."
+    cryptsetup luksFormat \
+        --type luks2 --pbkdf pbkdf2 --cipher aes-xts-plain64 \
+        --key-size 512 --hash sha512 --verify-passphrase --batch-mode \
+        "${ROOT_PART}"
+    cryptsetup open --allow-discards "${ROOT_PART}" "${ROOT_MAPPER_NAME}"
+    ROOT_OPENED=true
 
-# Создание LUKS-контейнера
-LOG_info "Создание LUKS2 контейнера..."
+    mkfs.btrfs -f -L archroot "${ROOT_MAPPER}"
+    mount "${ROOT_MAPPER}" "${TARGET_MOUNT}"
+    TARGET_MOUNTED=true
+    btrfs subvolume create "${TARGET_MOUNT}/@"
+    btrfs subvolume create "${TARGET_MOUNT}/@snapshots"
+    umount "${TARGET_MOUNT}"
 
-cryptsetup luksFormat \
-    --type luks2 \
-    --cipher aes-xts-plain64 \
-    --key-size 512 \
-    --hash sha512 \
-    "${DISK}3"
+    mount -o "subvol=@,${BTRFS_MOUNT_OPTIONS}" "${ROOT_MAPPER}" "${TARGET_MOUNT}"
+    install -d -m 0755 "${TARGET_MOUNT}/efi" "${TARGET_MOUNT}/boot"
+    install -d -m 0750 "${TARGET_MOUNT}/.snapshots"
+    mount -o "subvol=@snapshots,${BTRFS_MOUNT_OPTIONS}" "${ROOT_MAPPER}" "${TARGET_MOUNT}/.snapshots"
+    mount "${EFI_PART}" "${TARGET_MOUNT}/efi"
+}
 
-cryptsetup open "${DISK}3" cryptroot
+install_base_system() {
+    log_info "Установка базовой системы и пакетов..."
+    pacstrap -K "${TARGET_MOUNT}" "${BASE_PACKAGES[@]}"
+}
 
-# Форматирование Btrfs
-mkfs.btrfs /dev/mapper/cryptroot
+create_keyfiles_and_swap() {
+    local key_dir="${TARGET_MOUNT}/etc/cryptsetup-keys.d"
+    local root_key="${key_dir}/${ROOT_MAPPER_NAME}.key"
+    local swap_key="${key_dir}/${SWAP_MAPPER_NAME}.key"
 
-# Создание подтомов
-mount /dev/mapper/cryptroot /mnt
+    install -d -m 0700 "${key_dir}"
+    install -m 0600 /dev/null "${root_key}"
+    install -m 0600 /dev/null "${swap_key}"
+    dd if=/dev/urandom of="${root_key}" bs=64 count=1 conv=notrunc status=none
+    dd if=/dev/urandom of="${swap_key}" bs=64 count=1 conv=notrunc status=none
 
-btrfs subvolume create /mnt/@
-btrfs subvolume create /mnt/@snapshots
+    log_warn "Повторно введите пароль root-LUKS для добавления ключа initramfs."
+    cryptsetup luksAddKey "${ROOT_PART}" "${root_key}"
 
-umount /mnt
+    log_info "Создание отдельного LUKS2 swap-контейнера..."
+    cryptsetup luksFormat --type luks2 --pbkdf argon2id --batch-mode \
+        --key-file "${swap_key}" "${SWAP_PART}"
+    SWAP_OWNED=true
+    cryptsetup open --key-file "${swap_key}" "${SWAP_PART}" "${SWAP_MAPPER_NAME}"
+    mkswap -L swap "${SWAP_MAPPER}"
+    cryptsetup close "${SWAP_MAPPER_NAME}"
+}
 
-OPTS="noatime,compress=zstd:1,space_cache=v2,discard=async"
+write_mount_configuration() {
+    local root_uuid swap_uuid
+    root_uuid="$(blkid -s UUID -o value "${ROOT_PART}")"
+    swap_uuid="$(blkid -s UUID -o value "${SWAP_PART}")"
+    [[ -n "${root_uuid}" && -n "${swap_uuid}" ]] || die "Не удалось получить LUKS UUID."
 
-mount -o subvol=@,$OPTS /dev/mapper/cryptroot /mnt
+    genfstab -U "${TARGET_MOUNT}" >"${TARGET_MOUNT}/etc/fstab"
+    printf '/dev/mapper/%s none swap defaults 0 0\n' "${SWAP_MAPPER_NAME}" \
+        >>"${TARGET_MOUNT}/etc/fstab"
+    printf '%s UUID=%s /etc/cryptsetup-keys.d/%s.key luks\n' \
+        "${SWAP_MAPPER_NAME}" "${swap_uuid}" "${SWAP_MAPPER_NAME}" \
+        >"${TARGET_MOUNT}/etc/crypttab"
+    chmod 0600 "${TARGET_MOUNT}/etc/crypttab"
 
-mkdir -p /mnt/{boot,.snapshots}
+    install -d -m 0700 "${TARGET_MOUNT}/root/archplus-installer/lib" \
+        "${TARGET_MOUNT}/root/archplus-installer/assets"
+    install -m 0755 "${SCRIPT_DIR}/chroot.sh" "${SCRIPT_DIR}/niri.sh" \
+        "${TARGET_MOUNT}/root/archplus-installer/"
+    install -m 0644 "${SCRIPT_DIR}/config.sh" \
+        "${TARGET_MOUNT}/root/archplus-installer/config.sh"
+    install -m 0644 "${SCRIPT_DIR}/lib/common.sh" \
+        "${TARGET_MOUNT}/root/archplus-installer/lib/common.sh"
+    install -m 0644 "${SCRIPT_DIR}/attach/bg.jpg" \
+        "${TARGET_MOUNT}/root/archplus-installer/assets/bg.jpg"
+    printf 'ROOT_LUKS_UUID=%q\nSWAP_LUKS_UUID=%q\n' "${root_uuid}" "${swap_uuid}" \
+        >"${TARGET_MOUNT}/root/archplus-installer/install.env"
+    chmod 0600 "${TARGET_MOUNT}/root/archplus-installer/install.env"
+}
 
-mount -o subvol=@snapshots,$OPTS \
-    /dev/mapper/cryptroot \
-    /mnt/.snapshots
+run_chroot_stage() {
+    log_info "Запуск настройки внутри chroot..."
+    arch-chroot "${TARGET_MOUNT}" /root/archplus-installer/chroot.sh
+}
 
-mount "${DISK}1" /mnt/boot
+main() {
+    parse_arguments "$@"
+    if [[ "${DRY_RUN}" == true ]]; then
+        print_dry_run
+        exit 0
+    fi
 
-LOG_info "Разметка прошла успешно"
+    exec > >(tee -a "${LOG_FILE}") 2>&1
+    trap cleanup EXIT
+    trap 'log_error "Ошибка в строке ${LINENO}: ${BASH_COMMAND}"' ERR
 
-## ╔══════════════════════════════════════════╗
-## ║ Часть 03 - установка системы и настройка ║
-## ╚══════════════════════════════════════════╝
+    printf 'ArchPlus: автоматическая установка Arch Linux UEFI\n'
+    preflight
+    confirm_disk_erasure
+    prepare_live_environment
+    partition_disk
+    prepare_encrypted_root
+    install_base_system
+    create_keyfiles_and_swap
+    write_mount_configuration
+    run_chroot_stage
 
-echo ""
-echo "╔══════════════════════════════════╗"
-echo "║ Установка системы и её настройка ║"
-echo "╚══════════════════════════════════╝"
-echo ""
+    install -m 0600 "${LOG_FILE}" "${TARGET_MOUNT}/var/log/archplus-install.log"
+    INSTALL_FINISHED=true
+    printf '\nУстановка завершена. Извлеките установочный носитель и перезагрузитесь вручную.\n'
+}
 
-# Зеркала (опционально)
-# reflector --country Russia,Germany --age 12 --protocol https --latest 15 --sort rate --save /etc/pacman.d/mirrorlist
-
-echo "⬇️  Загрузка и установка пакетов..." # Базовые пакеты (для Intel, для AMD замените intel-ucode на amd-ucode)
-pacstrap -K /mnt \
-    base base-devel linux-zen linux-zen-headers linux-firmware \
-    grub efibootmgr cryptsetup lvm2 \
-    btrfs-progs \
-    snapper grub-btrfs inotify-tools \
-    networkmanager iwd \
-    intel-ucode sudo pipewire pipewire-pulse pipewire-alsa pavucontrol wireplumber \
-    nvidia-open nvidia-utils nvidia-settings \
-    nano wget --noconfirm
-
-LOG_info "✅ Базовая система установлена"
-
-# Генерация fstab
-genfstab -U /mnt >> /mnt/etc/fstab
-
-# Для шифрования добавляем crypttab
-echo "🔐 Настройка crypttab..."
-
-CRYPT_UUID=$(blkid -s UUID -o value ${DISK}3) # Получаем UUID зашифрованного раздела
-echo "cryptlvm UUID=$CRYPT_UUID none luks" >> /mnt/etc/crypttab
-LOG_success "crypttab настроен"
-
-# Вход в систему
-arch-chroot /mnt
+main "$@"
